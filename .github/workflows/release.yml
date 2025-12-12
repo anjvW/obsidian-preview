@@ -8,7 +8,7 @@ on:
     inputs:
       tag:
         description: "要发布的 tag（例如 v1.0.0）。在 tag push 触发时可忽略"
-        required: false
+        required: true
         type: string
       draft:
         description: "是否创建为草稿 Release（仅手动触发时生效）"
