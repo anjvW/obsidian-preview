@@ -1,0 +1,224 @@
+name: release-build
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要发布的 tag（例如 v1.0.0）。在 tag push 触发时可忽略"
+        required: false
+        type: string
+      draft:
+        description: "是否创建为草稿 Release（仅手动触发时生效）"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      app_name: ${{ steps.vars.outputs.app_name }}
+      tag: ${{ steps.vars.outputs.tag }}
+      draft: ${{ steps.vars.outputs.draft }}
+    steps:
+      - name: 计算发布参数
+        id: vars
+        shell: bash
+        run: |
+          set -euo pipefail
+          app_name="${GITHUB_REPOSITORY##*/}"
+
+          tag=""
+          if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
+            tag="${GITHUB_REF_NAME}"
+          else
+            tag="${{ github.event.inputs.tag || '' }}"
+          fi
+
+          if [[ -z "$tag" ]]; then
+            echo "缺少 tag：请通过 push tag（例如 v1.0.0）触发，或在 workflow_dispatch 输入 tag"
+            exit 1
+          fi
+
+          draft="false"
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            draft="${{ github.event.inputs.draft || 'false' }}"
+          fi
+
+          echo "app_name=$app_name" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "draft=$draft" >> "$GITHUB_OUTPUT"
+
+  test:
+    runs-on: ubuntu-latest
+    needs: [prepare]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Go test
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./...
+
+  build:
+    runs-on: ubuntu-latest
+    needs: [prepare, test]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            ext: ""
+            archive: tar.gz
+          - goos: linux
+            goarch: 386
+            ext: ""
+            archive: tar.gz
+          - goos: linux
+            goarch: arm64
+            ext: ""
+            archive: tar.gz
+          - goos: linux
+            goarch: arm
+            goarm: "7"
+            ext: ""
+            archive: tar.gz
+          - goos: linux
+            goarch: riscv64
+            ext: ""
+            archive: tar.gz
+
+          - goos: darwin
+            goarch: amd64
+            ext: ""
+            archive: tar.gz
+          - goos: darwin
+            goarch: arm64
+            ext: ""
+            archive: tar.gz
+
+          - goos: windows
+            goarch: amd64
+            ext: ".exe"
+            archive: zip
+          - goos: windows
+            goarch: 386
+            ext: ".exe"
+            archive: zip
+          - goos: windows
+            goarch: arm64
+            ext: ".exe"
+            archive: zip
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: 编译并打包
+        shell: bash
+        env:
+          APP_NAME: ${{ needs.prepare.outputs.app_name }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          EXT: ${{ matrix.ext }}
+          ARCHIVE: ${{ matrix.archive }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p dist work
+
+          suffix="${GOOS}_${GOARCH}"
+          if [[ -n "${GOARM:-}" ]]; then
+            suffix="${suffix}v${GOARM}"
+          fi
+
+          base="${APP_NAME}_${TAG}_${suffix}"
+          bin="${APP_NAME}${EXT}"
+
+          echo "构建: ${base}"
+          CGO_ENABLED=0 GOOS="${GOOS}" GOARCH="${GOARCH}" GOARM="${GOARM:-}" \
+            go build -trimpath -ldflags="-s -w" -o "work/${bin}" obsidian-preview.go
+
+          cp -f LICENSE README.md "work/"
+
+          if [[ "${ARCHIVE}" == "zip" ]]; then
+            (cd work && zip -9 -q "../dist/${base}.zip" "${bin}" LICENSE README.md)
+            sha256sum "dist/${base}.zip" > "dist/${base}.zip.sha256"
+          else
+            (cd work && tar -czf "../dist/${base}.tar.gz" "${bin}" LICENSE README.md)
+            sha256sum "dist/${base}.tar.gz" > "dist/${base}.tar.gz.sha256"
+          fi
+
+      - name: 上传构建产物（供发布 job 汇总）
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.goarm && format('-armv{0}', matrix.goarm) || '' }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    runs-on: ubuntu-latest
+    needs: [prepare, build]
+    steps:
+      - name: 下载所有构建产物
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: 创建/更新 Release 并上传文件
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          DRAFT: ${{ needs.prepare.outputs.draft }}
+        run: |
+          set -euo pipefail
+
+          draft_flag=""
+          if [[ "${DRAFT}" == "true" ]]; then
+            draft_flag="--draft"
+          fi
+
+          if ! gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release create "${TAG}" --generate-notes --target "${GITHUB_SHA}" ${draft_flag}
+          fi
+
+          shopt -s globstar nullglob
+          files=()
+          for f in dist/**; do
+            if [[ -f "$f" ]]; then
+              files+=("$f")
+            fi
+          done
+
+          if [[ "${#files[@]}" -eq 0 ]]; then
+            echo "未找到任何可上传文件"
+            exit 1
+          fi
+
+          gh release upload "${TAG}" "${files[@]}" --clobber
+
